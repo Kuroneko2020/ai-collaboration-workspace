@@ -113,7 +113,7 @@ def load_active(info: dict) -> tuple[dict, dict]:
     if state["workspace_id"] != config["workspace_id"]:
         raise ManagementError("启用状态与记忆配置的身份不一致，拒绝覆盖。")
     if state["template_version"] != info["template_version"]:
-        raise ManagementError("模板版本与启用状态不同；需要显式迁移，不能重新初始化。")
+        raise ManagementError("模板版本与启用状态不同；请使用新版发行包内的 中枢/工具/工作区管理/升级.py 升级，不能重新初始化。")
     if state["memory_mode"] not in ("manual", "auto"):
         raise ManagementError("记忆模式不合法。")
     for field in ("initialized_at", "updated_at"):

@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "template_name": "个人AI协作区",
-  "template_version": "0.1.0-preview.3",
+  "template_version": "0.1.0-preview.6",
   "default_memory_mode": "auto",
   "memory_config_schema_version": 1,
   "validated_target": "Windows、本地可写目录、Python 3.11+",

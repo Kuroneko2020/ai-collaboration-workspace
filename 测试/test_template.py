@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import uuid
 import zipfile
 
 PROJECT = Path(__file__).resolve().parents[1]
@@ -19,6 +20,7 @@ CONFIG = Path("中枢/记忆/配置.json")
 STATE = Path("中枢/启用状态.json")
 MEMORY = Path("中枢/工具/记忆工具/memory.py")
 MANAGER = Path("中枢/工具/工作区管理/工作区管理.py")
+UPGRADER = Path("中枢/工具/工作区管理/升级.py")
 TEMPLATE_INFO = Path("中枢/模板/模板信息.json")
 FACTORY_MANIFEST = "个人AI协作区/中枢/模板/出厂文件清单.json"
 
@@ -286,6 +288,30 @@ class TemplateTests(unittest.TestCase):
         with zipfile.ZipFile(archive) as package:
             self.assertIsNone(package.testzip())
             checksums = json.loads(package.read(FACTORY_MANIFEST))
+            source_files = {record["path"] for record in checksums["files"]}
+            self.assertFalse(any(path.startswith("中枢/灵魂/") for path in source_files))
+            for path in (
+                "中枢/记忆/记忆.md",
+                "中枢/记忆/管理规则.md",
+                "中枢/记忆/格式规范.md",
+                "中枢/工具/记忆工具/memory.py",
+            ):
+                self.assertIn(path, source_files)
+            package_names = set(package.namelist())
+            self.assertFalse(any("/中枢/灵魂/" in name for name in package_names))
+            self.assertIn("个人AI协作区/中枢/记忆/记忆.md", package_names)
+            memory_entry = package.read("个人AI协作区/中枢/记忆/记忆.md").decode("utf-8")
+            generated = memory_entry.split("<!-- BEGIN GENERATED MEMORY LINKS -->", 1)[1].split(
+                "<!-- END GENERATED MEMORY LINKS -->", 1
+            )[0]
+            self.assertEqual(generated.strip(), "")
+            maintenance_guide = package.read(
+                "个人AI协作区/中枢/工作区维护指南.md"
+            ).decode("utf-8")
+            self.assertIn("### 大工作区检索", maintenance_guide)
+            self.assertIn("### 文件/主题迁移与改名", maintenance_guide)
+            self.assertIn("首屏无命中", maintenance_guide)
+            self.assertIn("不能因为“迁移成功”自动扩大为删除授权", maintenance_guide)
             self.assertEqual(len(package.namelist()), len(checksums["files"]) + 1)
             for record in checksums["files"]:
                 raw = package.read("个人AI协作区/" + record["path"])
@@ -367,6 +393,162 @@ class TemplateTests(unittest.TestCase):
         second = self.build()
         self.assertNotEqual(first["archive"], second["archive"])
         self.assertEqual(first["sha256"], second["sha256"])
+
+    # ---- 升级脚本端到端用例 ----
+
+    def run_upgrade(self, script, *arguments, code=0):
+        return self.invoke(script, *arguments, "--json", cwd=self.base, code=code)
+
+    def make_old_workspace(self, version="0.0.0-test-old"):
+        # 旧版工作区用同源但版本号不同的自洽包模拟：出厂清单与内容一致，
+        # 不靠手工改运行文件伪造“本地修改”。
+        archive_path = self.craft_package(version)
+        extraction = self.base / f"旧版来源-{version}"
+        with zipfile.ZipFile(archive_path) as package:
+            package.extractall(extraction)
+        return extraction / "个人AI协作区"
+
+    def build_alt_package(self, marker):
+        # 构建器要求源码版本与发行清单一致，因此变体包只改内容、不改版本号；
+        # 旧版工作区的版本号本身已与当前清单版本不同，升级仍会触发。
+        alt_source = self.base / "变体源码"
+        shutil.copytree(SOURCE, alt_source)
+        readme = alt_source / "README.md"
+        readme.write_text(readme.read_text(encoding="utf-8") + "\n" + marker + "\n", encoding="utf-8")
+        return self.build(source=alt_source)
+
+    def craft_package(self, version, skip=None, extra=None):
+        tree = self.base / f"手工包树-{version}-{uuid.uuid4().hex[:8]}"
+        shutil.copytree(SOURCE, tree)
+        info_path = tree / TEMPLATE_INFO
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+        info["template_version"] = version
+        info_path.write_text(json.dumps(info, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        if skip:
+            (tree / skip).unlink()
+        if extra:
+            relative, content = extra
+            target = tree / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        records = []
+        for path in sorted(tree.rglob("*")):
+            if path.is_file():
+                raw = path.read_bytes()
+                records.append({"path": path.relative_to(tree).as_posix(), "size": len(raw), "sha256": hashlib.sha256(raw).hexdigest()})
+        manifest = {"schema_version": 1, "template_version": version, "files": records}
+        (tree / "中枢/模板/出厂文件清单.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        package = self.base / f"手工包-{version}.zip"
+        with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(tree.rglob("*")):
+                if path.is_file():
+                    archive.write(path, f"个人AI协作区/{path.relative_to(tree).as_posix()}")
+        return package
+
+    def test_upgrade_from_package_preserves_memory_and_advances_version(self):
+        package = self.build()
+        archive = Path(package["archive"])
+        workspace = self.make_old_workspace()
+        self.initialize("init", root=workspace)
+        self.memory("add", "--input", self.request("升级前记忆.json"), root=workspace)
+        result = self.run_upgrade(workspace / UPGRADER, "--package", archive, "--workspace", workspace)
+        self.assertEqual(result["result"], "upgraded")
+        self.assertEqual(result["from_version"], "0.0.0-test-old")
+        self.assertEqual(result["to_version"], package["template_version"])
+        state = json.loads((workspace / STATE).read_text(encoding="utf-8"))
+        self.assertEqual(state["template_version"], package["template_version"])
+        info = json.loads((workspace / TEMPLATE_INFO).read_text(encoding="utf-8"))
+        self.assertEqual(info["template_version"], package["template_version"])
+        config = json.loads((workspace / CONFIG).read_text(encoding="utf-8"))
+        self.assertEqual(config["workspace_id"], state["workspace_id"])
+        shown = self.memory("show", "mem-template-smoke", root=workspace)
+        self.assertIn("琥珀色", shown["entry"]["body"])
+        factory = json.loads((workspace / "中枢/模板/出厂文件清单.json").read_text(encoding="utf-8"))
+        self.assertEqual(factory["template_version"], package["template_version"])
+        backups = list((workspace / "升级备份").iterdir())
+        self.assertEqual(len(backups), 1)
+        self.assertIn("报告.md", {path.name for path in backups[0].iterdir()})
+        self.assertEqual(self.initialize("status", root=workspace)["template_version"], package["template_version"])
+
+    def test_upgrade_dry_run_writes_nothing(self):
+        package = self.build()
+        archive = Path(package["archive"])
+        workspace = self.make_old_workspace()
+        self.initialize("init", root=workspace)
+        result = self.run_upgrade(workspace / UPGRADER, "--package", archive, "--workspace", workspace, "--dry-run")
+        self.assertEqual(result["result"], "dry_run")
+        self.assertIsNone(result["backup_dir"])
+        self.assertTrue(result["plans"]["update"])
+        self.assertFalse((workspace / "升级备份").exists())
+        self.assertEqual(json.loads((workspace / TEMPLATE_INFO).read_text(encoding="utf-8"))["template_version"], "0.0.0-test-old")
+        self.assertEqual(self.initialize("status", root=workspace)["template_version"], "0.0.0-test-old")
+
+    def test_upgrade_is_no_op_on_same_version(self):
+        package = self.build()
+        archive = Path(package["archive"])
+        extraction = self.base / "同版来源"
+        with zipfile.ZipFile(archive) as source:
+            source.extractall(extraction)
+        workspace = extraction / "个人AI协作区"
+        self.initialize("init", root=workspace)
+        result = self.run_upgrade(workspace / UPGRADER, "--package", archive, "--workspace", workspace)
+        self.assertEqual(result["result"], "no_op")
+        self.assertFalse((workspace / "升级备份").exists())
+        self.assertEqual(self.initialize("status", root=workspace)["memory_mode"], "auto")
+
+    def test_upgrade_conflict_backs_up_and_takes_new(self):
+        package = self.build()
+        archive = Path(package["archive"])
+        workspace = self.make_old_workspace()
+        self.initialize("init", root=workspace)
+        readme = workspace / "README.md"
+        readme.write_text(readme.read_text(encoding="utf-8") + "\n本地自定义行。\n", encoding="utf-8")
+        alt = self.build_alt_package("新版独有标记")
+        result = self.run_upgrade(workspace / UPGRADER, "--package", Path(alt["archive"]), "--workspace", workspace)
+        self.assertEqual(result["result"], "upgraded")
+        self.assertIn("README.md", result["plans"]["conflict"])
+        self.assertIn("新版独有标记", (workspace / "README.md").read_text(encoding="utf-8"))
+        backups = list((workspace / "升级备份").iterdir())
+        self.assertEqual(len(backups), 1)
+        self.assertIn("本地自定义行", (backups[0] / "README.md").read_text(encoding="utf-8"))
+
+    def test_upgrade_handles_upstream_deletion_and_addition(self):
+        package = self.build()
+        archive = Path(package["archive"])
+        workspace = self.make_old_workspace()
+        self.initialize("init", root=workspace)
+        crafted = self.craft_package("0.1.0-test-craft", skip=".gitignore", extra=("参考/新增文件.txt", "新增内容".encode("utf-8")))
+        result = self.run_upgrade(workspace / UPGRADER, "--package", crafted, "--workspace", workspace)
+        self.assertEqual(result["result"], "upgraded")
+        self.assertIn(".gitignore", result["plans"]["delete"])
+        self.assertIn("参考/新增文件.txt", result["plans"]["add"])
+        self.assertFalse((workspace / ".gitignore").exists())
+        self.assertEqual((workspace / "参考" / "新增文件.txt").read_text(encoding="utf-8"), "新增内容")
+        backups = list((workspace / "升级备份").iterdir())
+        self.assertTrue((backups[0] / ".gitignore").is_file())
+
+    def test_upgrade_refuses_uninitialized_workspace(self):
+        package = self.build()
+        workspace = self.make_old_workspace()
+        result = self.run_upgrade(workspace / UPGRADER, "--package", package["archive"], "--workspace", workspace, code=2)
+        self.assertFalse(result["ok"])
+
+    def test_upgrade_refuses_tampered_package(self):
+        package = self.build()
+        archive = Path(package["archive"])
+        workspace = self.make_old_workspace()
+        self.initialize("init", root=workspace)
+        tampered = self.base / "篡改包.zip"
+        with zipfile.ZipFile(archive) as source, zipfile.ZipFile(tampered, "w") as target:
+            for item in source.infolist():
+                data = source.read(item.filename)
+                if item.filename.endswith("AGENTS.md"):
+                    data += "被篡改。\n".encode("utf-8")
+                target.writestr(item, data)
+        result = self.run_upgrade(workspace / UPGRADER, "--package", tampered, "--workspace", workspace, code=2)
+        self.assertFalse(result["ok"])
+        self.assertIn("校验", result["error"])
+        self.assertEqual(json.loads((workspace / TEMPLATE_INFO).read_text(encoding="utf-8"))["template_version"], "0.0.0-test-old")
 
 
 if __name__ == "__main__":
